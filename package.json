@@ -1,0 +1,16 @@
+{
+  "name": "opencode-plugins",
+  "private": true,
+  "type": "module",
+  "description": "Personal OpenCode plugins",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "1.17.4",
+    "typescript": "^5.7.0"
+  },
+  "dependencies": {
+    "@types/node": "^26.3.0"
+  }
+}
