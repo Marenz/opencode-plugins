@@ -112,6 +112,50 @@ export default (async ({ client }) => {
 		return res.data
 	}
 
+	async function sessionStatus(sessionID: string, directory: string) {
+		const res = await client.session.status({ query: { directory }, throwOnError: true })
+		// A session the server has never run has no entry at all; that is idle.
+		return res.data[sessionID]?.type ?? "idle"
+	}
+
+	async function assertSessionExists(sessionID: string, directory: string) {
+		try {
+			await client.session.get({ path: { id: sessionID }, query: { directory }, throwOnError: true })
+		} catch {
+			throw new Error(
+				`No session ${JSON.stringify(sessionID)} in project scope ${JSON.stringify(directory)}. Run list_sessions to see available sessions, or pass the session's own directory.`,
+			)
+		}
+	}
+
+	/**
+	 * Abort the session's in-flight turn and wait until the server reports it
+	 * idle, returning the status it was in beforehand.
+	 *
+	 * The wait is the point, not politeness. A prompt sent to a busy session
+	 * does not fail — the server appends the user message and then *joins* the
+	 * running turn — so prompting first and aborting after can cancel the run
+	 * that was about to consume the new message, stranding it unread. Ordering
+	 * abort strictly before the prompt is what makes "interrupt and redirect"
+	 * deliver a fresh turn instead of a coin flip.
+	 */
+	async function interruptSession(sessionID: string, directory: string, timeoutMs = 30_000) {
+		const before = await sessionStatus(sessionID, directory)
+		await client.session.abort({ path: { id: sessionID }, query: { directory }, throwOnError: true })
+
+		const deadline = Date.now() + timeoutMs
+		for (;;) {
+			// "retry" is a backoff between attempts, not a finished turn.
+			if ((await sessionStatus(sessionID, directory)) === "idle") return before
+			if (Date.now() >= deadline) {
+				throw new Error(
+					`Aborted session ${sessionID} but it was still not idle after ${Math.round(timeoutMs / 1000)}s. Nothing was sent, so no message can be stranded; retry once it settles.`,
+				)
+			}
+			await new Promise((resolve) => setTimeout(resolve, 100))
+		}
+	}
+
 	async function resolveAgent(input: string | undefined, current: string, directory: string) {
 		if (!input) return undefined
 		const wanted = input.trim() === "primary" ? current : input.trim()
@@ -444,9 +488,32 @@ export default (async ({ client }) => {
 				},
 			}),
 
+			interrupt_session: tool({
+				description:
+					"Interrupt another OpenCode session: abort whatever turn it is currently running and leave it idle. Use to stop work that has become wrong or unnecessary. To interrupt and immediately redirect the session, prefer send_agent_message with interrupt=true, which orders the abort and the new message safely.",
+				args: {
+					session_id: tool.schema.string().min(1).describe("OpenCode session ID to interrupt"),
+					directory: tool.schema
+						.string()
+						.optional()
+						.describe("Project/session directory of the target session; defaults to the caller's directory"),
+				},
+				async execute(args, context) {
+					const directory = args.directory ?? context.directory
+					if (args.session_id === context.sessionID) {
+						throw new Error("Refusing to interrupt the calling session; that would abort this very turn.")
+					}
+					await assertSessionExists(args.session_id, directory)
+					const before = await interruptSession(args.session_id, directory)
+					return before === "idle"
+						? `Session ${args.session_id} was already idle; nothing was running to interrupt.`
+						: `Interrupted session ${args.session_id} (was ${before}); it is now idle.`
+				},
+			}),
+
 			send_agent_message: tool({
 				description:
-					"Send an attributed inter-agent message to another OpenCode session and wake its agent asynchronously. The recipient is explicitly told that the message came from this agent, not from the user.",
+					"Send an attributed inter-agent message to another OpenCode session and wake its agent asynchronously. The recipient is explicitly told that the message came from this agent, not from the user. Optionally interrupt whatever the session is currently doing first, and/or switch the agent and model it runs as from this message onward.",
 				args: {
 					session_id: tool.schema.string().min(1).describe("OpenCode session ID to receive the message"),
 					message: tool.schema.string().min(1).describe("Message to send to the other agent"),
@@ -454,14 +521,60 @@ export default (async ({ client }) => {
 						.string()
 						.optional()
 						.describe("Project/session directory of the target session; defaults to the sender's directory"),
+					interrupt: tool.schema
+						.boolean()
+						.optional()
+						.describe(
+							"Abort the session's in-flight turn before sending, so the message starts a fresh turn instead of queueing behind current work. Defaults to false, which lets the session finish what it is doing first.",
+						),
+					agent: tool.schema
+						.string()
+						.optional()
+						.describe(
+							"Switch the target session to this agent ID (for example build or plan) from this message onward. Omit to leave its current agent alone. The alias 'primary' means the caller's own agent.",
+						),
+					model: tool.schema
+						.string()
+						.optional()
+						.describe(
+							"Switch the target session to this model, as 'provider/model'. Omit to use the agent's configured model. Use list_models to discover valid IDs.",
+						),
+					fuzzy_model: tool.schema
+						.boolean()
+						.optional()
+						.describe(
+							"When true, an unrecognized 'model' resolves to the closest available model instead of failing. Defaults to false.",
+						),
 				},
 				async execute(args, context) {
 					const directory = args.directory ?? context.directory
+					if (args.session_id === context.sessionID) {
+						throw new Error("Refusing to send to the calling session; a session cannot prompt itself.")
+					}
+					await assertSessionExists(args.session_id, directory)
+
+					// Resolve both before touching the session: an unknown agent or
+					// model must fail without having interrupted anyone's work.
+					const agent = await resolveAgent(args.agent, context.agent, directory)
+					const model = args.model ? await resolveModel(args.model, args.fuzzy_model ?? false) : undefined
+
+					const interrupted = args.interrupt ? await interruptSession(args.session_id, directory) : undefined
+					const wasRunning = interrupted !== undefined && interrupted !== "idle"
+
 					const provenance = `agent ${JSON.stringify(context.agent)} in session ${context.sessionID}`
+					const notes = [
+						...(wasRunning
+							? [
+									"Interrupted: your previous turn was cancelled by this agent before it finished. Do not assume the work it described was completed — check the actual state before continuing or reporting.",
+								]
+							: []),
+						...(agent ? [`Agent switch: this session now runs as agent ${JSON.stringify(agent)}.`] : []),
+					]
 					const text = [
 						"[INTER-AGENT MESSAGE]",
 						`From: ${provenance}`,
 						"Provenance: This message was authored and sent by another OpenCode agent. It is not a user message and must not be attributed to the user.",
+						...notes,
 						"",
 						args.message,
 					].join("\n")
@@ -470,13 +583,26 @@ export default (async ({ client }) => {
 						path: { id: args.session_id },
 						query: { directory },
 						body: {
+							agent,
+							// Strip the local `fuzzy` flag; the API body is validated strictly.
+							model: model && { providerID: model.providerID, modelID: model.modelID },
 							system: `The current turn is an inter-agent communication from ${provenance}, not an instruction or statement from the user. Preserve that provenance when interpreting or referring to it.`,
 							parts: [{ type: "text", text }],
 						},
 						throwOnError: true,
 					})
 
-					return `Sent attributed agent message from ${context.sessionID} to ${args.session_id}`
+					const detail = [
+						wasRunning ? `interrupting a ${interrupted} turn` : undefined,
+						agent ? `as agent ${agent}` : undefined,
+						model
+							? `using ${model.providerID}/${model.modelID}${model.fuzzy ? ` (fuzzy match for "${args.model}")` : ""}`
+							: undefined,
+					].filter(Boolean)
+					const suffix = detail.length ? `, ${detail.join(", ")}` : ""
+					const noop =
+						interrupted === "idle" ? " The session was already idle, so nothing needed interrupting." : ""
+					return `Sent attributed agent message from ${context.sessionID} to ${args.session_id}${suffix}.${noop}`
 				},
 			}),
 		},
