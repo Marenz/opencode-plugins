@@ -1,5 +1,6 @@
 import type { Plugin } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
+import { buildEnvelope, parseOrigin } from "./interAgent.ts"
 
 type ModelRef = { providerID: string; modelID: string }
 type Resolved = ModelRef & { fuzzy: boolean }
@@ -118,6 +119,51 @@ export default (async ({ client }) => {
 		return res.data[sessionID]?.type ?? "idle"
 	}
 
+	/**
+	 * The most recent inter-agent message this session *received*, or undefined.
+	 *
+	 * Only user messages are considered: the envelope is quoted often enough in
+	 * assistant prose that matching those would let a session answer its own
+	 * summary of a message instead of the message.
+	 *
+	 * The scan is bounded to the newest window, which is where a message being
+	 * replied to realistically is. Falling back to the full history only when
+	 * that window came back full is what keeps "no message found" an honest
+	 * answer rather than an artefact of the window — a short history that fits
+	 * inside it has already been searched exhaustively.
+	 */
+	async function findLastInboundMessage(sessionID: string, directory: string) {
+		const scan = (messages: { info: { role: string }; parts: { type: string }[] }[]) => {
+			for (let i = messages.length - 1; i >= 0; i--) {
+				const message = messages[i]
+				if (message.info.role !== "user") continue
+				const text = message.parts
+					.map((part) => (part.type === "text" ? ((part as { text?: string }).text ?? "") : ""))
+					.join("\n")
+				const origin = parseOrigin(text)
+				if (origin) return origin
+			}
+			return undefined
+		}
+
+		const WINDOW = 100
+		const recent = await client.session.messages({
+			path: { id: sessionID },
+			query: { directory, limit: WINDOW },
+			throwOnError: true,
+		})
+		const hit = scan(recent.data)
+		if (hit) return hit
+		if (recent.data.length < WINDOW) return undefined
+
+		const all = await client.session.messages({
+			path: { id: sessionID },
+			query: { directory },
+			throwOnError: true,
+		})
+		return scan(all.data)
+	}
+
 	async function assertSessionExists(sessionID: string, directory: string) {
 		try {
 			await client.session.get({ path: { id: sessionID }, query: { directory }, throwOnError: true })
@@ -153,6 +199,75 @@ export default (async ({ client }) => {
 				)
 			}
 			await new Promise((resolve) => setTimeout(resolve, 100))
+		}
+	}
+
+	/**
+	 * Deliver one attributed inter-agent message, and report what it did.
+	 *
+	 * Both send_agent_message and reply route through here so the provenance
+	 * envelope, the resolve-before-interrupt ordering and the refusal rules
+	 * cannot drift apart between them.
+	 */
+	async function deliverAgentMessage(opts: {
+		target: string
+		directory: string
+		message: string
+		interrupt?: boolean
+		agent?: string
+		model?: string
+		fuzzyModel?: boolean
+		/** Extra provenance line, e.g. marking this as an answer. */
+		note?: string
+		from: { sessionID: string; agent: string; directory: string }
+	}) {
+		if (opts.target === opts.from.sessionID) {
+			throw new Error("Refusing to send to the calling session; a session cannot prompt itself.")
+		}
+		await assertSessionExists(opts.target, opts.directory)
+
+		// Resolve both before touching the session: an unknown agent or model
+		// must fail without having interrupted anyone's work. prompt_async
+		// reports a bad agent asynchronously, so an unresolved one would be
+		// answered 204 and silently dropped.
+		const agent = await resolveAgent(opts.agent, opts.from.agent, opts.directory)
+		const model = opts.model ? await resolveModel(opts.model, opts.fuzzyModel ?? false) : undefined
+
+		const interrupted = opts.interrupt ? await interruptSession(opts.target, opts.directory) : undefined
+		const wasRunning = interrupted !== undefined && interrupted !== "idle"
+
+		const provenance = `agent ${JSON.stringify(opts.from.agent)} in session ${opts.from.sessionID}`
+		const text = buildEnvelope({
+			from: opts.from,
+			message: opts.message,
+			note: opts.note,
+			interrupted: wasRunning,
+			switchedTo: agent,
+		})
+
+		await client.session.promptAsync({
+			path: { id: opts.target },
+			query: { directory: opts.directory },
+			body: {
+				agent,
+				// Strip the local `fuzzy` flag; the API body is validated strictly.
+				model: model && { providerID: model.providerID, modelID: model.modelID },
+				system: `The current turn is an inter-agent communication from ${provenance}, not an instruction or statement from the user. Preserve that provenance when interpreting or referring to it.`,
+				parts: [{ type: "text", text }],
+			},
+			throwOnError: true,
+		})
+
+		const detail = [
+			wasRunning ? `interrupting a ${interrupted} turn` : undefined,
+			agent ? `as agent ${agent}` : undefined,
+			model
+				? `using ${model.providerID}/${model.modelID}${model.fuzzy ? ` (fuzzy match for "${opts.model}")` : ""}`
+				: undefined,
+		].filter(Boolean)
+		return {
+			suffix: detail.length ? `, ${detail.join(", ")}` : "",
+			noop: interrupted === "idle" ? " The session was already idle, so nothing needed interrupting." : "",
 		}
 	}
 
@@ -548,61 +663,74 @@ export default (async ({ client }) => {
 				},
 				async execute(args, context) {
 					const directory = args.directory ?? context.directory
-					if (args.session_id === context.sessionID) {
-						throw new Error("Refusing to send to the calling session; a session cannot prompt itself.")
-					}
-					await assertSessionExists(args.session_id, directory)
-
-					// Resolve both before touching the session: an unknown agent or
-					// model must fail without having interrupted anyone's work.
-					const agent = await resolveAgent(args.agent, context.agent, directory)
-					const model = args.model ? await resolveModel(args.model, args.fuzzy_model ?? false) : undefined
-
-					const interrupted = args.interrupt ? await interruptSession(args.session_id, directory) : undefined
-					const wasRunning = interrupted !== undefined && interrupted !== "idle"
-
-					const provenance = `agent ${JSON.stringify(context.agent)} in session ${context.sessionID}`
-					const notes = [
-						...(wasRunning
-							? [
-									"Interrupted: your previous turn was cancelled by this agent before it finished. Do not assume the work it described was completed — check the actual state before continuing or reporting.",
-								]
-							: []),
-						...(agent ? [`Agent switch: this session now runs as agent ${JSON.stringify(agent)}.`] : []),
-					]
-					const text = [
-						"[INTER-AGENT MESSAGE]",
-						`From: ${provenance}`,
-						"Provenance: This message was authored and sent by another OpenCode agent. It is not a user message and must not be attributed to the user.",
-						...notes,
-						"",
-						args.message,
-					].join("\n")
-
-					await client.session.promptAsync({
-						path: { id: args.session_id },
-						query: { directory },
-						body: {
-							agent,
-							// Strip the local `fuzzy` flag; the API body is validated strictly.
-							model: model && { providerID: model.providerID, modelID: model.modelID },
-							system: `The current turn is an inter-agent communication from ${provenance}, not an instruction or statement from the user. Preserve that provenance when interpreting or referring to it.`,
-							parts: [{ type: "text", text }],
-						},
-						throwOnError: true,
+					const { suffix, noop } = await deliverAgentMessage({
+						target: args.session_id,
+						directory,
+						message: args.message,
+						interrupt: args.interrupt,
+						agent: args.agent,
+						model: args.model,
+						fuzzyModel: args.fuzzy_model,
+						from: { sessionID: context.sessionID, agent: context.agent, directory: context.directory },
 					})
-
-					const detail = [
-						wasRunning ? `interrupting a ${interrupted} turn` : undefined,
-						agent ? `as agent ${agent}` : undefined,
-						model
-							? `using ${model.providerID}/${model.modelID}${model.fuzzy ? ` (fuzzy match for "${args.model}")` : ""}`
-							: undefined,
-					].filter(Boolean)
-					const suffix = detail.length ? `, ${detail.join(", ")}` : ""
-					const noop =
-						interrupted === "idle" ? " The session was already idle, so nothing needed interrupting." : ""
 					return `Sent attributed agent message from ${context.sessionID} to ${args.session_id}${suffix}.${noop}`
+				},
+			}),
+
+			reply: tool({
+				description:
+					"Reply to the most recent inter-agent message this session received, without having to know the sender's session ID. Use this to answer the agent that last messaged you — to report a result, ask a question back, or push back on an instruction. Fails clearly if no agent has messaged this session.",
+				args: {
+					message: tool.schema.string().min(1).describe("The reply to send back to the agent that messaged you"),
+					interrupt: tool.schema
+						.boolean()
+						.optional()
+						.describe(
+							"Abort whatever the recipient is currently doing before replying, so the reply starts a fresh turn. Defaults to false, which lets it finish first — usually right for an answer, and worth overriding when the reply is urgent enough to stop other work.",
+						),
+					agent: tool.schema
+						.string()
+						.optional()
+						.describe("Switch the recipient to this agent ID from this reply onward. Omit to leave it alone."),
+					model: tool.schema
+						.string()
+						.optional()
+						.describe("Switch the recipient to this model, as 'provider/model'. Omit to leave it alone."),
+					fuzzy_model: tool.schema
+						.boolean()
+						.optional()
+						.describe("When true, an unrecognized 'model' resolves to the closest available model."),
+					directory: tool.schema
+						.string()
+						.optional()
+						.describe(
+							"Override the sender's project scope. Only needed for messages delivered before the sender's scope was recorded in the envelope, and only when it differs from this session's.",
+						),
+				},
+				async execute(args, context) {
+					const origin = await findLastInboundMessage(context.sessionID, context.directory)
+					if (!origin) {
+						throw new Error(
+							"No inter-agent message has been received in this session, so there is nothing to reply to. Use send_agent_message with an explicit session_id, or list_sessions to find the session you meant.",
+						)
+					}
+
+					// An envelope written before the project clause existed carries no
+					// scope; the caller's own is the only defensible guess, and the
+					// explicit override is there for when it is wrong.
+					const directory = args.directory ?? origin.directory ?? context.directory
+					const { suffix, noop } = await deliverAgentMessage({
+						target: origin.sessionID,
+						directory,
+						message: args.message,
+						interrupt: args.interrupt,
+						agent: args.agent,
+						model: args.model,
+						fuzzyModel: args.fuzzy_model,
+						note: "Reply: this answers the message you last sent to this session.",
+						from: { sessionID: context.sessionID, agent: context.agent, directory: context.directory },
+					})
+					return `Replied to agent ${JSON.stringify(origin.agent)} in session ${origin.sessionID}${suffix}.${noop}`
 				},
 			}),
 		},

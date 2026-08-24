@@ -13,6 +13,7 @@ session — delegation, monitoring, and now interruption.
 | `list_sessions` | Recent sessions in the project scope with live status. |
 | `list_models` | Available `provider/model` IDs, grouped by provider. |
 | `send_agent_message` | Send an attributed inter-agent message to another session. Optionally `interrupt` it first and/or switch its `agent`/`model`. |
+| `reply` | Answer the agent that last messaged this session, without needing its session ID. |
 | `interrupt_session` | Abort whatever a session is currently running, leaving it idle. |
 | `wake_after_idle` / `stop_idle_wake` | Recurring idle watchdog for manager sessions. |
 
@@ -52,6 +53,29 @@ described actually finished.
 `interrupt_session` is the bare primitive for when you only want to stop work.
 Both tools refuse to target the calling session.
 
+### Replying
+
+`reply` answers whoever last messaged this session, so a delegated session can
+talk back without being told its manager's session ID:
+
+```
+reply(message = "Done, but the migration test is still red because ...")
+```
+
+It finds the most recent *received* inter-agent message by scanning this
+session's history backwards and parsing the envelope's `From:` line. Only user
+messages count — agents quote the envelope in their own prose often enough that
+matching assistant messages would let a session answer its own summary of a
+message instead of the message.
+
+The scan is bounded to the newest 100 messages and only falls back to the full
+history when that window came back full, so "no message to reply to" is an
+honest answer rather than an artefact of the window.
+
+The sender's project scope is recorded in the envelope so a reply can cross
+scopes. Messages delivered before that was recorded parse fine and fall back to
+the replier's own scope; `directory` overrides it if that guess is wrong.
+
 ### Agent and model switching
 
 `agent` is applied to the *user message*, and OpenCode drives each turn from
@@ -63,8 +87,22 @@ own configured model take over, which is normally what you want.
 
 ```sh
 npm install
-npm run typecheck    # tsc --noEmit against the real @opencode-ai/plugin types
+npm run check        # typecheck + unit tests
 ```
+
+### A plugin file may only export its plugin
+
+OpenCode loads a plugin module by iterating **every** export and treating each
+one as a plugin factory, throwing `TypeError: Plugin export is not a function`
+on anything that is not one (`Plugin.getLegacyPlugins`). The `default`-export
+form used here is a function, not an object, so it is not detected as a v1
+plugin and does not short-circuit that scan.
+
+The consequence is worth stating plainly: adding a single exported constant to
+`spawn-session.ts` does not degrade it, it stops the whole file from loading and
+takes every tool in it with it — with nothing in the server log to say so. That
+is why the pure, testable parts live in `src/interAgent.ts` and are imported,
+rather than being exported from the plugin for the tests to reach.
 
 ## Deploy
 

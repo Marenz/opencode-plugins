@@ -9,6 +9,7 @@
     "noUncheckedIndexedAccess": false,
     "skipLibCheck": true,
     "noEmit": true,
+    "allowImportingTsExtensions": true,
     "allowJs": true,
     "checkJs": false,
     "verbatimModuleSyntax": true

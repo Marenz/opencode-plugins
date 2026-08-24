@@ -4,7 +4,9 @@
   "type": "module",
   "description": "Personal OpenCode plugins",
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --test src/*.test.ts",
+    "check": "npm run typecheck && npm test"
   },
   "devDependencies": {
     "@opencode-ai/plugin": "1.17.4",
