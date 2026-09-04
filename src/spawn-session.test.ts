@@ -1,6 +1,7 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 import { INTER_AGENT_MARKER, buildEnvelope, parseOrigin } from "./interAgent.ts"
+import { setSessionTitle, type SessionTitleClient } from "./sessionTitle.ts"
 
 const from = { sessionID: "ses_fcb9a2e47ffe1moGAkhBuvMURO", agent: "build", directory: "/home/marenz/Projects/chronica" }
 
@@ -73,4 +74,41 @@ test("text that is not an inter-agent message has no origin", () => {
 	]) {
 		assert.equal(parseOrigin(text), undefined, `unexpectedly found an origin in ${JSON.stringify(text.slice(0, 40))}`)
 	}
+})
+
+function clientWith(update: SessionTitleClient["session"]["update"]): SessionTitleClient {
+	return { session: { update } }
+}
+
+test("setSessionTitle returns a confirmation with the session ID and title", async () => {
+	const client = clientWith(async (input) => {
+		assert.deepEqual(input, {
+			path: { id: "ses_123" },
+			query: { directory: "/home/marenz/Projects/chronica" },
+			body: { title: "Fix session titles" },
+		})
+		return {}
+	})
+
+	assert.equal(
+		await setSessionTitle(client, "ses_123", "Fix session titles", "/home/marenz/Projects/chronica"),
+		"Set title for session ses_123 to Fix session titles.",
+	)
+})
+
+test("setSessionTitle returns the SDK response error with the tool prefix", async () => {
+	const client = clientWith(async () => ({ error: { message: "Session not found" } }))
+
+	const result = await setSessionTitle(client, "ses_missing", "New title", "/tmp/work")
+	assert.match(result, /^session_set_title: /)
+	assert.match(result, /Session not found/)
+})
+
+test("setSessionTitle returns the first line of a thrown error with the tool prefix", async () => {
+	const client = clientWith(async () => {
+		throw new Error("Request failed\nresponse details")
+	})
+
+	const result = await setSessionTitle(client, "ses_123", "New title", "/tmp/work")
+	assert.equal(result, "session_set_title: Request failed")
 })

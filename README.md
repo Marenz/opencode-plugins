@@ -15,6 +15,7 @@ session — delegation, monitoring, and now interruption.
 | `send_agent_message` | Send an attributed inter-agent message to another session. Optionally `interrupt` it first and/or switch its `agent`/`model`. |
 | `reply` | Answer the agent that last messaged this session, without needing its session ID. |
 | `interrupt_session` | Abort whatever a session is currently running, leaving it idle. |
+| `session_set_title` | Set another session's title through the SDK instead of writing OpenCode's database directly. |
 | `wake_after_idle` / `stop_idle_wake` | Recurring idle watchdog for manager sessions. |
 
 ### Interrupting and redirecting
