@@ -12,6 +12,17 @@ test("a delivered envelope round-trips back to its sender", () => {
 	assert.deepEqual(origin, { agent: "build", sessionID: from.sessionID, directory: from.directory })
 })
 
+test("an initial delegation is immediately answerable", () => {
+	const origin = parseOrigin(
+		buildEnvelope({
+			from,
+			message: "work autonomously and report back",
+			note: "Initial delegation: use the reply tool to report back to the session that spawned you.",
+		}),
+	)
+	assert.deepEqual(origin, { agent: "build", sessionID: from.sessionID, directory: from.directory })
+})
+
 test("the optional envelope lines do not disturb the origin", () => {
 	for (const extra of [
 		{ note: "Reply: this answers the message you last sent to this session." },

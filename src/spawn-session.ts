@@ -531,7 +531,7 @@ export default (async ({ client }) => {
 
 			spawn_session: tool({
 				description:
-					"Create a new independent OpenCode session in the caller's current server and project scope, start it asynchronously with an initial prompt, and return its session ID immediately. Use when the user asks to open, spawn, or delegate work to a separate concurrent session.",
+					"Create a new independent OpenCode session in the caller's current server and project scope, start it asynchronously with an attributed initial prompt, and return its session ID immediately. The spawned session can use reply immediately to report back. Use when the user asks to open, spawn, or delegate work to a separate concurrent session.",
 				args: {
 					title: tool.schema.string().min(1).describe("Title shown in the OpenCode session switcher"),
 					prompt: tool.schema.string().min(1).describe("Initial prompt for the new session"),
@@ -570,10 +570,16 @@ export default (async ({ client }) => {
 					const directory = args.directory ?? context.directory
 					const sessionDirectory = args.session_directory ?? context.directory
 					const agent = await resolveAgent(args.agent, context.agent, sessionDirectory)
-					const prompt =
+					const delegation =
 						directory === sessionDirectory
 							? args.prompt
 							: `Work in ${directory}. Use that path as the working directory for all repository-specific tools and commands.\n\n${args.prompt}`
+					const from = { sessionID: context.sessionID, agent: context.agent, directory: context.directory }
+					const prompt = buildEnvelope({
+						from,
+						message: delegation,
+						note: "Initial delegation: use the reply tool to report back to the session that spawned you.",
+					})
 
 					const model = args.model ? await resolveModel(args.model, args.fuzzy_model ?? false) : undefined
 
@@ -590,6 +596,7 @@ export default (async ({ client }) => {
 							agent,
 							// Strip the local `fuzzy` flag; the API body is validated strictly.
 							model: model && { providerID: model.providerID, modelID: model.modelID },
+							system: `The current turn is an inter-agent delegation from agent ${JSON.stringify(from.agent)} in session ${from.sessionID}, not an instruction or statement from the user. Preserve that provenance when interpreting or referring to it.`,
 							parts: [{ type: "text", text: prompt }],
 						},
 						throwOnError: true,

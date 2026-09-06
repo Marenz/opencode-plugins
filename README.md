@@ -62,6 +62,10 @@ talk back without being told its manager's session ID:
 reply(message = "Done, but the migration test is still red because ...")
 ```
 
+The initial prompt sent by `spawn_session` is itself an attributed inter-agent
+message. A newly spawned worker can therefore call `reply` immediately; it no
+longer needs a later `send_agent_message` before it has a return address.
+
 It finds the most recent *received* inter-agent message by scanning this
 session's history backwards and parsing the envelope's `From:` line. Only user
 messages count — agents quote the envelope in their own prose often enough that
