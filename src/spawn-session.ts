@@ -1,6 +1,7 @@
 import type { Plugin } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
 import { buildEnvelope, parseOrigin } from "./interAgent.ts"
+import { PermissionLog, observationCaveat, verdictFor } from "./permissions.ts"
 import { sessionAgent } from "./sessionAgents.ts"
 
 type ModelRef = { providerID: string; modelID: string }
@@ -61,6 +62,11 @@ function score(needle: string, candidate: string) {
 export default (async ({ client }) => {
 	const idleWakes = new Map<string, IdleWake>()
 	const sessionAgents = new Map<string, string>()
+	// Observes permission requests so a manager can tell "waiting on the user"
+	// from "dead". Read-only by construction: see src/permissions.ts. The
+	// `permission.ask` hook — the one that could actually grant something — is
+	// deliberately not registered anywhere in this plugin.
+	const permissions = new PermissionLog()
 
 	function stopTimer(wake: IdleWake) {
 		if (wake.timer) clearTimeout(wake.timer)
@@ -382,6 +388,20 @@ export default (async ({ client }) => {
 		},
 
 		event: async ({ event }) => {
+			// A session parked on a confirmation still reports `busy`, so these
+			// two events are the only way to know it is waiting on the user.
+			if (event.type === "permission.updated") {
+				permissions.opened(event.properties)
+				return
+			}
+			if (event.type === "permission.replied") {
+				permissions.replied(
+					event.properties.sessionID,
+					event.properties.permissionID,
+					event.properties.response,
+				)
+				return
+			}
 			if (event.type === "session.idle") {
 				startIdleTimer(event.properties.sessionID)
 				return
@@ -397,6 +417,7 @@ export default (async ({ client }) => {
 			if (event.type === "session.deleted") {
 				disarm(event.properties.info.id)
 				sessionAgents.delete(event.properties.info.id)
+				permissions.forget(event.properties.info.id)
 			}
 		},
 
@@ -518,6 +539,10 @@ export default (async ({ client }) => {
 							id: session.id,
 							title: session.title,
 							status: statuses.data[session.id]?.type ?? "unknown",
+							// `busy` alone cannot say this: a session waiting on a
+							// user confirmation looks exactly like one that is
+							// working, and exactly like one that has wedged.
+							...(permissions.isBlocked(session.id) ? { awaiting_permission: true } : {}),
 							directory: session.directory,
 							...(session.parentID ? { parent_id: session.parentID } : {}),
 							created_at: new Date(session.time.created).toISOString(),
@@ -526,6 +551,72 @@ export default (async ({ client }) => {
 
 					if (!sessions.length) return `No sessions matched${needle ? ` ${JSON.stringify(args.filter)}` : ""}.`
 					return JSON.stringify(sessions, null, 2)
+				},
+			}),
+
+			session_permission_status: tool({
+				description:
+					"Ask whether a session is blocked waiting for the user to answer a permission confirmation, rather than dead or stuck. opencode reports such a session as 'busy', identical to one that is working, so this is the only way to tell them apart. Call it from a manager session before concluding that a delegated session has died, and before interrupting or respawning one. Omit session_id to list every session currently waiting. Read-only: it can never answer or grant a permission.",
+				args: {
+					session_id: tool.schema
+						.string()
+						.min(1)
+						.optional()
+						.describe(
+							"Session to ask about. Omit to list every session in scope that is currently waiting on a confirmation.",
+						),
+					directory: tool.schema
+						.string()
+						.optional()
+						.describe("Project/session directory of the target session; defaults to the caller's directory"),
+					include_request_text: tool.schema
+						.boolean()
+						.optional()
+						.describe(
+							"Also return each request's own description, which for a bash request is the command line verbatim and may contain credentials. Defaults to false. The permission type and waiting time are enough to escalate — the user sees the full request in their own TUI — so only set this when you genuinely need to describe the request itself.",
+						),
+				},
+				async execute(args, context) {
+					const directory = args.directory ?? context.directory
+					const now = Date.now()
+					const includeText = args.include_request_text ?? false
+					const caveat = observationCaveat(permissions.since)
+
+					if (!args.session_id) {
+						const pending = permissions.allPending(now, includeText)
+						if (!pending.length) {
+							return `No session is currently waiting on a permission confirmation.\n\n${caveat}`
+						}
+						return JSON.stringify(
+							{
+								waiting: pending,
+								guidance:
+									"Each of these is alive and cannot proceed until the user answers in their opencode TUI. Escalate to the user by session id; do not interrupt, respawn or replace them.",
+								observation_caveat: caveat,
+							},
+							null,
+							2,
+						)
+					}
+
+					await assertSessionExists(args.session_id, directory)
+					const status = await sessionStatus(args.session_id, directory)
+					const pending = permissions.pendingFor(args.session_id, now, includeText)
+					const resolved = permissions.recentlyResolved(args.session_id, now, includeText)
+
+					return JSON.stringify(
+						{
+							session_id: args.session_id,
+							status,
+							awaiting_permission: pending.length > 0,
+							verdict: verdictFor({ status, pending, resolved, observingSince: permissions.since, now }),
+							pending,
+							...(resolved.length ? { recently_answered: resolved } : {}),
+							observation_caveat: caveat,
+						},
+						null,
+						2,
+					)
 				},
 			}),
 
