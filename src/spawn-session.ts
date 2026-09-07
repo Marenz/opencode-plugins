@@ -2,8 +2,8 @@ import type { Plugin } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
 import { buildEnvelope, parseOrigin } from "./interAgent.ts"
 import { setSessionTitle } from "./sessionTitle.ts"
+import { deliveryAgent } from "./sessionAgents.ts"
 import { PermissionLog, observationCaveat, verdictFor } from "./permissions.ts"
-import { sessionAgent } from "./sessionAgents.ts"
 
 type ModelRef = { providerID: string; modelID: string }
 type Resolved = ModelRef & { fuzzy: boolean }
@@ -242,7 +242,7 @@ export default (async ({ client }) => {
 		// reports a bad agent asynchronously, so an unresolved one would be
 		// answered 204 and silently dropped.
 		const explicitAgent = await resolveAgent(opts.agent, opts.from.agent, opts.directory)
-		const agent = sessionAgent(sessionAgents, opts.target, explicitAgent)
+		const agent = deliveryAgent(explicitAgent)
 		const model = opts.model ? await resolveModel(opts.model, opts.fuzzyModel ?? false) : undefined
 
 		const interrupted = opts.interrupt ? await interruptSession(opts.target, opts.directory) : undefined
