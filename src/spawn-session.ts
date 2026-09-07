@@ -1,6 +1,7 @@
 import type { Plugin } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
 import { buildEnvelope, parseOrigin } from "./interAgent.ts"
+import { setSessionTitle } from "./sessionTitle.ts"
 import { PermissionLog, observationCaveat, verdictFor } from "./permissions.ts"
 import { sessionAgent } from "./sessionAgents.ts"
 
@@ -710,6 +711,21 @@ export default (async ({ client }) => {
 						? ` using ${model.providerID}/${model.modelID}${model.fuzzy ? ` (fuzzy match for "${args.model}")` : ""}`
 						: ""
 					return `Spawned independent session ${created.data.id}${using} for ${directory} in session scope ${sessionDirectory}`
+				},
+			}),
+
+			session_set_title: tool({
+				description: "Set the title of an OpenCode session by its ID.",
+				args: {
+					session_id: tool.schema.string().min(1).describe("OpenCode session ID to rename"),
+					title: tool.schema.string().min(1).describe("New title for the session"),
+					directory: tool.schema
+						.string()
+						.optional()
+						.describe("Project/session directory of the target session; defaults to the caller's directory"),
+				},
+				async execute(args, context) {
+					return setSessionTitle(client, args.session_id, args.title, args.directory ?? context.directory)
 				},
 			}),
 
