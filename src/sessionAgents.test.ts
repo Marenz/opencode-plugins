@@ -1,17 +1,14 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { sessionAgent } from "./sessionAgents.ts"
+import { deliveryAgent } from "./sessionAgents.ts"
 
-test("a recorded session agent is inherited", () => {
-	const agents = new Map([["worker", "general"]])
-	assert.equal(sessionAgent(agents, "worker"), "general")
+test("an explicit agent is used to address the delivery", () => {
+	assert.equal(deliveryAgent("build"), "build")
 })
 
-test("an explicit session agent wins over the recorded one", () => {
-	const agents = new Map([["worker", "general"]])
-	assert.equal(sessionAgent(agents, "worker", "build"), "build")
-})
-
-test("a session without a record stays agentless", () => {
-	assert.equal(sessionAgent(new Map(), "manager"), undefined)
+test("an omitted agent leaves the recipient's agent untouched", () => {
+	// The regression: this must not fall back to any remembered agent for the
+	// target session, or every reply after one explicit switch would keep
+	// re-applying it.
+	assert.equal(deliveryAgent(undefined), undefined)
 })
