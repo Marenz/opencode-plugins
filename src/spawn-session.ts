@@ -15,6 +15,19 @@ type IdleWake = {
 	timer?: ReturnType<typeof setTimeout>
 }
 
+/**
+ * The running server reports an `agent` field on a session (confirmed live
+ * against opencode 1.18.29, matching the `SessionV2Info` schema in its own
+ * OpenAPI doc) that the pinned `@opencode-ai/sdk` client's `Session` type
+ * does not declare — a schema/type drift in the upstream package, not
+ * something this repo controls. Read it through a narrow cast instead of
+ * widening the whole `Session` type; absent on a session with no messages
+ * yet.
+ */
+function currentAgentOf(session: object): string | undefined {
+	return (session as { agent?: string }).agent
+}
+
 /** Lowercase and drop separators, so "claude-opus-5" ~ "Claude Opus 5". */
 function normalize(value: string) {
 	return value.toLowerCase().replace(/[^a-z0-9]/g, "")
@@ -62,7 +75,6 @@ function score(needle: string, candidate: string) {
 
 export default (async ({ client }) => {
 	const idleWakes = new Map<string, IdleWake>()
-	const sessionAgents = new Map<string, string>()
 	// Observes permission requests so a manager can tell "waiting on the user"
 	// from "dead". Read-only by construction: see src/permissions.ts. The
 	// `permission.ask` hook — the one that could actually grant something — is
@@ -100,7 +112,13 @@ export default (async ({ client }) => {
 			].join("\n")
 
 			try {
-				const agent = sessionAgents.get(sessionID)
+				// The server has no "leave the agent alone" concept: an omitted
+				// `agent` on the prompt body resolves to the global default agent,
+				// not the session's own. Fetch the session's CURRENT agent live and
+				// pass it back explicitly — a cache here would just as easily go
+				// stale, e.g. if the user switched agent by hand in the meantime.
+				const info = await client.session.get({ path: { id: sessionID }, query: { directory: wake.directory }, throwOnError: true })
+				const agent = currentAgentOf(info.data)
 				await client.session.promptAsync({
 					path: { id: sessionID },
 					query: { directory: wake.directory },
@@ -177,7 +195,8 @@ export default (async ({ client }) => {
 
 	async function assertSessionExists(sessionID: string, directory: string) {
 		try {
-			await client.session.get({ path: { id: sessionID }, query: { directory }, throwOnError: true })
+			const res = await client.session.get({ path: { id: sessionID }, query: { directory }, throwOnError: true })
+			return res.data
 		} catch {
 			throw new Error(
 				`No session ${JSON.stringify(sessionID)} in project scope ${JSON.stringify(directory)}. Run list_sessions to see available sessions, or pass the session's own directory.`,
@@ -235,14 +254,24 @@ export default (async ({ client }) => {
 		if (opts.target === opts.from.sessionID) {
 			throw new Error("Refusing to send to the calling session; a session cannot prompt itself.")
 		}
-		await assertSessionExists(opts.target, opts.directory)
+		const target = await assertSessionExists(opts.target, opts.directory)
 
 		// Resolve both before touching the session: an unknown agent or model
 		// must fail without having interrupted anyone's work. prompt_async
 		// reports a bad agent asynchronously, so an unresolved one would be
 		// answered 204 and silently dropped.
 		const explicitAgent = await resolveAgent(opts.agent, opts.from.agent, opts.directory)
-		const agent = deliveryAgent(explicitAgent)
+		// The server has no "leave the agent alone" concept: an omitted `agent`
+		// on the prompt body resolves to the GLOBAL default agent (config
+		// default, usually "build"), not to whatever the session was last
+		// running as — confirmed by reading the server's
+		// SessionPrompt.createUserMessage, which does
+		// `t.agent ? agents.get(t.agent) : agents.defaultInfo()` with no
+		// awareness of the session at all. So omitting `agent` here would
+		// silently flip every recipient to the default agent on every
+		// unaddressed reply. Pass the session's OWN current agent explicitly
+		// instead, so "no explicit agent" really means "no change".
+		const agent = deliveryAgent(explicitAgent, currentAgentOf(target))
 		const model = opts.model ? await resolveModel(opts.model, opts.fuzzyModel ?? false) : undefined
 
 		const interrupted = opts.interrupt ? await interruptSession(opts.target, opts.directory) : undefined
@@ -269,7 +298,6 @@ export default (async ({ client }) => {
 			},
 			throwOnError: true,
 		})
-		if (explicitAgent) sessionAgents.set(opts.target, explicitAgent)
 
 		const detail = [
 			wasRunning ? `interrupting a ${interrupted} turn` : undefined,
@@ -385,7 +413,6 @@ export default (async ({ client }) => {
 		dispose: async () => {
 			for (const wake of idleWakes.values()) stopTimer(wake)
 			idleWakes.clear()
-			sessionAgents.clear()
 		},
 
 		event: async ({ event }) => {
@@ -417,7 +444,6 @@ export default (async ({ client }) => {
 			}
 			if (event.type === "session.deleted") {
 				disarm(event.properties.info.id)
-				sessionAgents.delete(event.properties.info.id)
 				permissions.forget(event.properties.info.id)
 			}
 		},
@@ -693,11 +719,9 @@ export default (async ({ client }) => {
 						},
 						throwOnError: true,
 					})
-					if (agent) sessionAgents.set(created.data.id, agent)
 					try {
 						await waitForInitialMessage(created.data.id, sessionDirectory)
 					} catch (error) {
-						sessionAgents.delete(created.data.id)
 						await client.session
 							.delete({
 								path: { id: created.data.id },

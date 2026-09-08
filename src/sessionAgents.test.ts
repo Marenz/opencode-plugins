@@ -2,13 +2,18 @@ import assert from "node:assert/strict"
 import test from "node:test"
 import { deliveryAgent } from "./sessionAgents.ts"
 
-test("an explicit agent is used to address the delivery", () => {
-	assert.equal(deliveryAgent("build"), "build")
+test("an explicit agent wins over the session's current one", () => {
+	assert.equal(deliveryAgent("build", "plan"), "build")
 })
 
-test("an omitted agent leaves the recipient's agent untouched", () => {
-	// The regression: this must not fall back to any remembered agent for the
-	// target session, or every reply after one explicit switch would keep
-	// re-applying it.
-	assert.equal(deliveryAgent(undefined), undefined)
+test("an omitted agent re-addresses the session as its own current agent", () => {
+	// The regression: the server has no "leave it alone" primitive for an
+	// omitted `agent` field — it resolves to the global default agent
+	// instead. So "no change" has to be spelled out explicitly as the
+	// session's own current agent, not as `undefined`.
+	assert.equal(deliveryAgent(undefined, "plan"), "plan")
+})
+
+test("a brand new session with no agent yet stays agentless", () => {
+	assert.equal(deliveryAgent(undefined, undefined), undefined)
 })
