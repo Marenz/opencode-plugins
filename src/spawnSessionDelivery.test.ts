@@ -1,6 +1,7 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 import spawnSessionPlugin from "./spawn-session.ts"
+import { buildEnvelope } from "./interAgent.ts"
 
 /**
  * Integration-level regression coverage for `deliverAgentMessage`: proves
@@ -19,8 +20,11 @@ const FROM_SESSION = "ses_sender0000000000000000000"
 type PromptCall = { body: Record<string, unknown> }
 
 function fakeClient(opts: {
-	targetSession: { agent?: string; model?: { id: string; providerID: string; variant?: string } }
+	targetSession: { agent?: string; model?: unknown }
 	agents?: string[]
+	/** When set, `session.messages` (queried against FROM_SESSION) returns
+	 * one inbound envelope from the target, so `reply` can resolve it. */
+	inboundFrom?: { agent: string; sessionID: string; directory: string }
 }) {
 	const prompts: PromptCall[] = []
 	const client = {
@@ -34,6 +38,11 @@ function fakeClient(opts: {
 			},
 			async status() {
 				return { data: {} }
+			},
+			async messages() {
+				if (!opts.inboundFrom) return { data: [] }
+				const text = buildEnvelope({ from: opts.inboundFrom, message: "original message" })
+				return { data: [{ info: { role: "user" }, parts: [{ type: "text", text }] }] }
 			},
 		},
 		app: {
@@ -65,6 +74,16 @@ async function sendAgentMessage(client: unknown, args: Record<string, unknown>) 
 		directory: DIRECTORY,
 	})
 }
+
+async function sendReply(client: unknown, args: Record<string, unknown>) {
+	const plugin = await (spawnSessionPlugin as unknown as (input: { client: unknown }) => Promise<any>)({ client })
+	return plugin.tool.reply.execute(args, {
+		sessionID: FROM_SESSION,
+		agent: "build",
+		directory: DIRECTORY,
+	})
+}
+
 
 test("omitted agent and model: outgoing payload carries the session's own current agent+model, not the defaults", async () => {
 	const { client, prompts } = fakeClient({
@@ -139,6 +158,63 @@ test("a session whose model field is missing the runtime `id`/`providerID` shape
 	assert.equal(body.agent, "build")
 	assert.equal(body.model, undefined)
 })
+
+test("a session whose model field is a wholly wrong type (not an object) does not crash currentModelOf", async () => {
+	const { client, prompts } = fakeClient({
+		targetSession: { agent: "build", model: "not-an-object" as unknown },
+	})
+	await sendAgentMessage(client, { session_id: TARGET, message: "hi" })
+
+	const { body } = prompts[0]
+	assert.equal(body.agent, "build")
+	assert.equal(body.model, undefined)
+})
+
+test("reply() carries the exact same omitted-agent/model preservation as send_agent_message", async () => {
+	const { client, prompts } = fakeClient({
+		targetSession: { agent: "manager", model: { id: "gpt-6-astra", providerID: "openai", variant: "default" } },
+		inboundFrom: { agent: "manager", sessionID: TARGET, directory: DIRECTORY },
+	})
+	await sendReply(client, { message: "here's the finding" })
+
+	assert.equal(prompts.length, 1)
+	const { body } = prompts[0]
+	assert.equal(body.agent, "manager")
+	assert.deepEqual(body.model, { providerID: "openai", modelID: "gpt-6-astra" })
+	assert.equal(body.variant, undefined)
+})
+
+test("reply() with an explicit model override behaves the same as send_agent_message's", async () => {
+	const { client, prompts } = fakeClient({
+		targetSession: { agent: "manager", model: { id: "claude-fable-5", providerID: "anthropic", variant: "thinking" } },
+		inboundFrom: { agent: "manager", sessionID: TARGET, directory: DIRECTORY },
+	})
+	await sendReply(client, { message: "switching", model: "openai/gpt-6-astra" })
+
+	const { body } = prompts[0]
+	assert.deepEqual(body.model, { providerID: "openai", modelID: "gpt-6-astra" })
+	assert.equal(body.variant, undefined)
+})
+
+test(
+	"SCOPE NOTE (not a bug fix, documents current behavior): an explicit model matching the " +
+		"session's own current model+provider still drops its variant, same as any other explicit switch — " +
+		"there is no 'reaffirm the same model, keep the variant' path, and no tool parameter to request one",
+	async () => {
+		const { client, prompts } = fakeClient({
+			targetSession: { agent: "manager", model: { id: "gpt-6-astra", providerID: "openai", variant: "thinking" } },
+		})
+		// Same provider/model as the session is already running, passed explicitly.
+		await sendAgentMessage(client, { session_id: TARGET, message: "hi", model: "openai/gpt-6-astra" })
+
+		const { body } = prompts[0]
+		assert.deepEqual(body.model, { providerID: "openai", modelID: "gpt-6-astra" })
+		// If this test starts failing because the tool grows a way to request
+		// same-model-keep-variant, update this assertion deliberately — do not
+		// "fix" it by guessing what should happen instead.
+		assert.equal(body.variant, undefined)
+	},
+)
 
 test("idle-wake watchdog re-addresses the session with its own current agent+model too", async () => {
 	const { client, prompts } = fakeClient({
