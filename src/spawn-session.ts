@@ -3,6 +3,12 @@ import { tool } from "@opencode-ai/plugin"
 import { buildEnvelope, parseOrigin } from "./interAgent.ts"
 import { setSessionTitle } from "./sessionTitle.ts"
 import { deliveryAgent, deliveryModel, type DeliveryModel } from "./sessionAgents.ts"
+import {
+	buildPinSnapshot,
+	mergePinIntoMetadata,
+	readPin,
+	resolveDeliveryAgainstPin,
+} from "./sessionPin.ts"
 import { PermissionLog, observationCaveat, verdictFor } from "./permissions.ts"
 
 type ModelRef = { providerID: string; modelID: string }
@@ -46,6 +52,32 @@ function currentModelOf(session: object): DeliveryModel | undefined {
 		modelID: model.id,
 		...(model.variant && model.variant !== "default" ? { variant: model.variant } : {}),
 	}
+}
+
+/** A session's own free-form `metadata`, defensively typed as unknown for `readPin` to sort out. */
+function metadataOf(session: object): unknown {
+	return (session as { metadata?: unknown }).metadata
+}
+
+/**
+ * `session.update`'s body type is pinned to `{ title?: string }` in the SDK
+ * — the same schema drift as `.agent`/`.model` on `Session`: the live API
+ * (confirmed via its own OpenAPI doc) also accepts `metadata`. Route the
+ * write through a single narrow cast rather than scattering `as` casts at
+ * each call site.
+ */
+async function updateSessionMetadata(
+	client: { session: { update(input: unknown): Promise<unknown> } },
+	sessionID: string,
+	directory: string,
+	metadata: Record<string, unknown>,
+): Promise<void> {
+	await client.session.update({
+		path: { id: sessionID },
+		query: { directory },
+		body: { metadata },
+		throwOnError: true,
+	})
 }
 
 /** Lowercase and drop separators, so "claude-opus-5" ~ "Claude Opus 5". */
@@ -138,11 +170,15 @@ export default (async ({ client }) => {
 				// pass it back explicitly — a cache here would just as easily go
 				// stale, e.g. if the user switched agent by hand in the meantime.
 				const info = await client.session.get({ path: { id: sessionID }, query: { directory: wake.directory }, throwOnError: true })
-				const agent = currentAgentOf(info.data)
+				// A pin (see sessionPin.ts) takes priority over the session's own
+				// live agent/model here too — the watchdog never has an explicit
+				// field to conflict with, so it's a pure override, not a check.
+				const pin = readPin(metadataOf(info.data))
+				const agent = pin?.agent ?? currentAgentOf(info.data)
 				// Same fix as agent: re-passing `agent` alone can itself flip the
 				// model, since an omitted `model` falls through to that agent's own
 				// configured model rather than the session's actual one.
-				const model = currentModelOf(info.data)
+				const model = pin?.model ?? currentModelOf(info.data)
 				await client.session.promptAsync({
 					path: { id: sessionID },
 					query: { directory: wake.directory },
@@ -287,6 +323,27 @@ export default (async ({ client }) => {
 		// reports a bad agent asynchronously, so an unresolved one would be
 		// answered 204 and silently dropped.
 		const explicitAgent = await resolveAgent(opts.agent, opts.from.agent, opts.directory)
+		const explicitModel = opts.model ? await resolveModel(opts.model, opts.fuzzyModel ?? false) : undefined
+
+		// A pinned session (see sessionPin.ts) overrides the usual "preserve
+		// current" fallback: an omitted field defers to the pin, and an
+		// explicit field conflicting with it is refused outright — resolved
+		// before interruptSession below, same reasoning as resolving agent/model
+		// before it: a rejected delivery must not have interrupted anyone first.
+		const pin = readPin(metadataOf(target))
+		let pinnedAgent: string | undefined
+		let pinnedModel: DeliveryModel | undefined
+		if (pin) {
+			const resolution = resolveDeliveryAgainstPin(pin, explicitAgent, explicitModel)
+			if (resolution.conflict) {
+				throw new Error(
+					`Session ${opts.target} is pinned to ${resolution.conflict.field} ${JSON.stringify(resolution.conflict.pinned)}; refusing to switch it to ${JSON.stringify(resolution.conflict.requested)}. That session can remove its own pin with set_session_pin(enabled=false).`,
+				)
+			}
+			pinnedAgent = resolution.agent
+			pinnedModel = resolution.model
+		}
+
 		// The server has no "leave the agent alone" concept: an omitted `agent`
 		// on the prompt body resolves to the GLOBAL default agent (config
 		// default, usually "build"), not to whatever the session was last
@@ -297,12 +354,11 @@ export default (async ({ client }) => {
 		// silently flip every recipient to the default agent on every
 		// unaddressed reply. Pass the session's OWN current agent explicitly
 		// instead, so "no explicit agent" really means "no change".
-		const agent = deliveryAgent(explicitAgent, currentAgentOf(target))
-		const explicitModel = opts.model ? await resolveModel(opts.model, opts.fuzzyModel ?? false) : undefined
+		const agent = deliveryAgent(pinnedAgent ?? explicitAgent, currentAgentOf(target))
 		// Same reasoning as `agent` above: an omitted `model` does not leave the
 		// session's model alone either. It falls through to the (now correctly
 		// preserved) agent's own configured model — see deliveryModel's doc.
-		const model = deliveryModel(explicitModel, currentModelOf(target))
+		const model = deliveryModel(pinnedModel ?? explicitModel, currentModelOf(target))
 
 		const interrupted = opts.interrupt ? await interruptSession(opts.target, opts.directory) : undefined
 		const wasRunning = interrupted !== undefined && interrupted !== "idle"
@@ -515,6 +571,53 @@ export default (async ({ client }) => {
 					return disarm(context.sessionID)
 						? `Stopped idle wake for session ${context.sessionID}.`
 						: `No idle wake was armed for session ${context.sessionID}.`
+				},
+			}),
+
+			set_session_pin: tool({
+				description:
+					"Pin or unpin THIS session's own current agent+model+variant to a durable snapshot (survives a server restart). While pinned, any reply/send_agent_message/idle-wake delivery addressed to this session that tries to switch it to a DIFFERENT agent or model is refused instead of applied; an omitted agent/model in an incoming delivery still defers to the pin. Self-only — there is no session_id argument, and no way to pin or unpin any other session through this tool. Calling this with enabled=true again while already pinned REPLACES the old pin with whatever the session's agent/model/variant is right now — an intentional re-snapshot, not a no-op; call it again after a legitimate model switch to update the pin. Not a security boundary: ordinary tool permissions are the only gate on calling this, same as any other tool.",
+				args: {
+					enabled: tool.schema
+						.boolean()
+						.describe(
+							"true: pin this session to its current agent/model/variant right now, replacing any existing pin. false: remove any existing pin, restoring the ordinary preserve-current behavior.",
+						),
+				},
+				async execute(args, context) {
+					const current = await client.session.get({
+						path: { id: context.sessionID },
+						query: { directory: context.directory },
+						throwOnError: true,
+					})
+					const existingMetadata = (current.data as { metadata?: Record<string, unknown> }).metadata
+
+					if (!args.enabled) {
+						await updateSessionMetadata(
+							client,
+							context.sessionID,
+							context.directory,
+							mergePinIntoMetadata(existingMetadata, undefined),
+						)
+						return `Unpinned session ${context.sessionID}.`
+					}
+
+					const pin = buildPinSnapshot(currentAgentOf(current.data), currentModelOf(current.data))
+					if (!pin) {
+						throw new Error(
+							`Cannot pin session ${context.sessionID}: it has no recorded agent or model yet. Send at least one message first.`,
+						)
+					}
+					await updateSessionMetadata(
+						client,
+						context.sessionID,
+						context.directory,
+						mergePinIntoMetadata(existingMetadata, pin),
+					)
+					const modelDesc = pin.model
+						? `${pin.model.providerID}/${pin.model.modelID}${pin.model.variant ? ` (${pin.model.variant})` : ""}`
+						: "(no model recorded)"
+					return `Pinned session ${context.sessionID} to agent ${JSON.stringify(pin.agent ?? null)}, model ${modelDesc}.`
 				},
 			}),
 
