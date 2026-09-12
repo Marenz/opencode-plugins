@@ -2,7 +2,13 @@ import type { Plugin } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
 import { buildEnvelope, parseOrigin } from "./interAgent.ts"
 import { setSessionTitle } from "./sessionTitle.ts"
-import { deliveryAgent, deliveryModel, type DeliveryModel } from "./sessionAgents.ts"
+import {
+	deliveryAgent,
+	deliveryModel,
+	deliveryVariant,
+	variantRequest,
+	type DeliveryModel,
+} from "./sessionAgents.ts"
 import {
 	buildPinSnapshot,
 	mergePinIntoMetadata,
@@ -57,6 +63,24 @@ function currentModelOf(session: object): DeliveryModel | undefined {
 /** A session's own free-form `metadata`, defensively typed as unknown for `readPin` to sort out. */
 function metadataOf(session: object): unknown {
 	return (session as { metadata?: unknown }).metadata
+}
+
+/**
+ * The variants a model advertises, as `/config/providers` reports them.
+ *
+ * Schema drift again, of a third flavour: the live endpoint does carry a
+ * `variants` map per model (confirmed against opencode 1.18.30 — every model
+ * had the key, most a non-empty map such as `low, medium, high, xhigh, max`,
+ * and variants declared in the user's own config merge into the same map),
+ * and the server's public OpenAPI generator deliberately keeps the field
+ * while emptying its inner values. But the pinned `@opencode-ai/plugin`
+ * SDK's v1 `Model` type — the one `client.config.providers()` is typed
+ * against — predates it entirely and declares no `variants` at all. Only the
+ * key names are usable, which is all validation needs.
+ */
+function variantsOf(model: object): Record<string, unknown> | undefined {
+	const variants = (model as { variants?: unknown }).variants
+	return variants && typeof variants === "object" ? (variants as Record<string, unknown>) : undefined
 }
 
 /**
@@ -308,6 +332,7 @@ export default (async ({ client }) => {
 		interrupt?: boolean
 		agent?: string
 		model?: string
+		variant?: string
 		fuzzyModel?: boolean
 		/** Extra provenance line, e.g. marking this as an answer. */
 		note?: string
@@ -324,6 +349,7 @@ export default (async ({ client }) => {
 		// answered 204 and silently dropped.
 		const explicitAgent = await resolveAgent(opts.agent, opts.from.agent, opts.directory)
 		const explicitModel = opts.model ? await resolveModel(opts.model, opts.fuzzyModel ?? false) : undefined
+		const requestedVariant = variantRequest(opts.variant)
 
 		// A pinned session (see sessionPin.ts) overrides the usual "preserve
 		// current" fallback: an omitted field defers to the pin, and an
@@ -334,7 +360,7 @@ export default (async ({ client }) => {
 		let pinnedAgent: string | undefined
 		let pinnedModel: DeliveryModel | undefined
 		if (pin) {
-			const resolution = resolveDeliveryAgainstPin(pin, explicitAgent, explicitModel)
+			const resolution = resolveDeliveryAgainstPin(pin, explicitAgent, explicitModel, requestedVariant)
 			if (resolution.conflict) {
 				throw new Error(
 					`Session ${opts.target} is pinned to ${resolution.conflict.field} ${JSON.stringify(resolution.conflict.pinned)}; refusing to switch it to ${JSON.stringify(resolution.conflict.requested)}. That session can remove its own pin with set_session_pin(enabled=false).`,
@@ -359,6 +385,12 @@ export default (async ({ client }) => {
 		// session's model alone either. It falls through to the (now correctly
 		// preserved) agent's own configured model — see deliveryModel's doc.
 		const model = deliveryModel(pinnedModel ?? explicitModel, currentModelOf(target))
+		// An explicit `variant` applies to whichever model the message ends up
+		// addressing — the explicit one when there is one, otherwise the
+		// session's own current model — so it is resolved after `model`, and
+		// validated against it while a rejection can still cost nobody a turn.
+		const variant = deliveryVariant(requestedVariant, model)
+		if (requestedVariant?.variant && model) await assertVariantAvailable(model, requestedVariant.variant)
 
 		const interrupted = opts.interrupt ? await interruptSession(opts.target, opts.directory) : undefined
 		const wasRunning = interrupted !== undefined && interrupted !== "idle"
@@ -379,7 +411,7 @@ export default (async ({ client }) => {
 				agent,
 				// Strip the local `fuzzy` flag; the API body is validated strictly.
 				model: model && { providerID: model.providerID, modelID: model.modelID },
-				...(model?.variant ? { variant: model.variant } : {}),
+				...(variant ? { variant } : {}),
 				system: `The current turn is an inter-agent communication from ${provenance}, not an instruction or statement from the user. Preserve that provenance when interpreting or referring to it.`,
 				parts: [{ type: "text", text }],
 			},
@@ -392,11 +424,37 @@ export default (async ({ client }) => {
 			explicitModel
 				? `using ${explicitModel.providerID}/${explicitModel.modelID}${explicitModel.fuzzy ? ` (fuzzy match for "${opts.model}")` : ""}`
 				: undefined,
+			requestedVariant && (requestedVariant.variant ? `with variant ${requestedVariant.variant}` : "with no variant"),
 		].filter(Boolean)
 		return {
 			suffix: detail.length ? `, ${detail.join(", ")}` : "",
 			noop: interrupted === "idle" ? " The session was already idle, so nothing needed interrupting." : "",
 		}
+	}
+
+	/**
+	 * Reject a requested variant the model provably does not have.
+	 *
+	 * Worth doing client-side because the server does not do it at all: an
+	 * unknown variant resolves to an empty options object (the
+	 * `input.model.variants[input.user.model.variant]` lookup in
+	 * session/llm/request.ts), so a typo is a silent no-op that the session
+	 * then records as its variant and this plugin faithfully preserves from
+	 * then on.
+	 *
+	 * An absent or EMPTY `variants` map means "cannot validate here", never
+	 * "this model has no valid variants" — a server too old to report them
+	 * must not have every variant request rejected — so only a non-empty map
+	 * genuinely lacking the name is refused.
+	 */
+	async function assertVariantAvailable(model: ModelRef, variant: string) {
+		const { providers } = await listProviders()
+		const info = providers.find((provider) => provider.id === model.providerID)?.models[model.modelID]
+		const names = info ? Object.keys(variantsOf(info) ?? {}) : []
+		if (!names.length || names.includes(variant)) return
+		throw new Error(
+			`Unknown variant ${JSON.stringify(variant)} for ${model.providerID}/${model.modelID}. Available variants: ${names.sort().join(", ")}`,
+		)
 	}
 
 	async function resolveAgent(input: string | undefined, current: string, directory: string) {
@@ -576,7 +634,7 @@ export default (async ({ client }) => {
 
 			set_session_pin: tool({
 				description:
-					"Pin or unpin THIS session's own current agent+model+variant to a durable snapshot (survives a server restart). While pinned, any reply/send_agent_message/idle-wake delivery addressed to this session that tries to switch it to a DIFFERENT agent or model is refused instead of applied; an omitted agent/model in an incoming delivery still defers to the pin. Self-only — there is no session_id argument, and no way to pin or unpin any other session through this tool. Calling this with enabled=true again while already pinned REPLACES the old pin with whatever the session's agent/model/variant is right now — an intentional re-snapshot, not a no-op; call it again after a legitimate model switch to update the pin. Not a security boundary: ordinary tool permissions are the only gate on calling this, same as any other tool.",
+					"Pin or unpin THIS session's own current agent+model+variant to a durable snapshot (survives a server restart). While pinned, any reply/send_agent_message/idle-wake delivery addressed to this session that tries to switch it to a DIFFERENT agent, model or model variant is refused instead of applied; an omitted agent/model/variant in an incoming delivery still defers to the pin. Self-only — there is no session_id argument, and no way to pin or unpin any other session through this tool. Calling this with enabled=true again while already pinned REPLACES the old pin with whatever the session's agent/model/variant is right now — an intentional re-snapshot, not a no-op; call it again after a legitimate model switch to update the pin. Not a security boundary: ordinary tool permissions are the only gate on calling this, same as any other tool.",
 				args: {
 					enabled: tool.schema
 						.boolean()
@@ -811,6 +869,13 @@ export default (async ({ client }) => {
 						.describe(
 							"Model to run the session with, as 'provider/model' (e.g. anthropic/claude-opus-5). Defaults to the agent's configured model. Use list_models to discover valid IDs.",
 						),
+					variant: tool.schema
+						.string()
+						.min(1)
+						.optional()
+						.describe(
+							"Model variant to run the session with — a model's effort/thinking level, such as 'low', 'high' or 'max'. Applies to 'model' when given, otherwise to whichever model the agent runs by default. Omit to use no variant; 'default' means the same thing explicitly.",
+						),
 					fuzzy_model: tool.schema
 						.boolean()
 						.optional()
@@ -834,6 +899,14 @@ export default (async ({ client }) => {
 					})
 
 					const model = args.model ? await resolveModel(args.model, args.fuzzy_model ?? false) : undefined
+					// A brand new session has no model of its own to fall back to,
+					// so an omitted `model` leaves the choice to the agent — which
+					// this plugin cannot resolve, and therefore cannot validate the
+					// variant against. The server applies `variant` regardless of
+					// how the model was chosen, so the request is still honoured,
+					// just unchecked.
+					const requestedVariant = variantRequest(args.variant)
+					if (requestedVariant?.variant && model) await assertVariantAvailable(model, requestedVariant.variant)
 
 					const created = await client.session.create({
 						body: { title: args.title },
@@ -848,6 +921,7 @@ export default (async ({ client }) => {
 							agent,
 							// Strip the local `fuzzy` flag; the API body is validated strictly.
 							model: model && { providerID: model.providerID, modelID: model.modelID },
+							...(requestedVariant?.variant ? { variant: requestedVariant.variant } : {}),
 							system: `The current turn is an inter-agent delegation from agent ${JSON.stringify(from.agent)} in session ${from.sessionID}, not an instruction or statement from the user. Preserve that provenance when interpreting or referring to it.`,
 							parts: [{ type: "text", text: prompt }],
 						},
@@ -868,7 +942,8 @@ export default (async ({ client }) => {
 					const using = model
 						? ` using ${model.providerID}/${model.modelID}${model.fuzzy ? ` (fuzzy match for "${args.model}")` : ""}`
 						: ""
-					return `Spawned independent session ${created.data.id}${using} for ${directory} in session scope ${sessionDirectory}`
+					const withVariant = requestedVariant?.variant ? ` with variant ${requestedVariant.variant}` : ""
+					return `Spawned independent session ${created.data.id}${using}${withVariant} for ${directory} in session scope ${sessionDirectory}`
 				},
 			}),
 
@@ -912,7 +987,7 @@ export default (async ({ client }) => {
 
 			send_agent_message: tool({
 				description:
-					"Send an attributed inter-agent message to another OpenCode session and wake its agent asynchronously. The recipient is explicitly told that the message came from this agent, not from the user. Optionally interrupt whatever the session is currently doing first, and/or switch the agent and model it runs as from this message onward.",
+					"Send an attributed inter-agent message to another OpenCode session and wake its agent asynchronously. The recipient is explicitly told that the message came from this agent, not from the user. Optionally interrupt whatever the session is currently doing first, and/or switch the agent, model and model variant it runs as from this message onward.",
 				args: {
 					session_id: tool.schema.string().min(1).describe("OpenCode session ID to receive the message"),
 					message: tool.schema.string().min(1).describe("Message to send to the other agent"),
@@ -938,6 +1013,13 @@ export default (async ({ client }) => {
 						.describe(
 							"Switch the target session to this model, as 'provider/model'. Omit to use the agent's configured model. Use list_models to discover valid IDs.",
 						),
+					variant: tool.schema
+						.string()
+						.min(1)
+						.optional()
+						.describe(
+							"Switch the target session to this model variant — a model's effort/thinking level, such as 'low', 'high' or 'max'. Applies to 'model' when given, otherwise to the session's current model. Omit to leave the variant alone; pass 'default' to clear it.",
+						),
 					fuzzy_model: tool.schema
 						.boolean()
 						.optional()
@@ -954,6 +1036,7 @@ export default (async ({ client }) => {
 						interrupt: args.interrupt,
 						agent: args.agent,
 						model: args.model,
+						variant: args.variant,
 						fuzzyModel: args.fuzzy_model,
 						from: { sessionID: context.sessionID, agent: context.agent, directory: context.directory },
 					})
@@ -980,6 +1063,13 @@ export default (async ({ client }) => {
 						.string()
 						.optional()
 						.describe("Switch the recipient to this model, as 'provider/model'. Omit to leave it alone."),
+					variant: tool.schema
+						.string()
+						.min(1)
+						.optional()
+						.describe(
+							"Switch the recipient to this model variant — a model's effort/thinking level, such as 'low', 'high' or 'max'. Applies to 'model' when given, otherwise to the recipient's current model. Omit to leave the variant alone; pass 'default' to clear it.",
+						),
 					fuzzy_model: tool.schema
 						.boolean()
 						.optional()
@@ -1010,6 +1100,7 @@ export default (async ({ client }) => {
 						interrupt: args.interrupt,
 						agent: args.agent,
 						model: args.model,
+						variant: args.variant,
 						fuzzyModel: args.fuzzy_model,
 						note: "Reply: this answers the message you last sent to this session.",
 						from: { sessionID: context.sessionID, agent: context.agent, directory: context.directory },

@@ -297,6 +297,75 @@ test("an explicit model matching the pin keeps the pinned variant instead of dro
 	assert.equal(body.variant, "thinking")
 })
 
+test("an explicit variant conflicting with the pinned one is rejected, and no prompt is sent at all", async () => {
+	// The conservative reading of a pin: it locks the effort level too, so it
+	// is a genuine lock rather than one with a hole in it where effort is
+	// concerned.
+	const { client, prompts } = statefulFakeClient({
+		[TARGET]: {
+			agent: "manager",
+			metadata: {
+				sessionPin: { agent: "manager", model: { providerID: "openai", modelID: "gpt-6-astra", variant: "high" } },
+			},
+		},
+	})
+
+	await assert.rejects(
+		() => callTool(client, "send_agent_message", { session_id: TARGET, message: "harder", variant: "max" }, senderContext),
+		/pinned to variant "high"; refusing to switch it to "max"/,
+	)
+	assert.equal(prompts.length, 0)
+})
+
+test("asking a pinned session for a variant when the pin records none is refused too", async () => {
+	const { client, prompts } = statefulFakeClient({
+		[TARGET]: {
+			agent: "manager",
+			metadata: { sessionPin: { agent: "manager", model: { providerID: "openai", modelID: "gpt-6-astra" } } },
+		},
+	})
+
+	await assert.rejects(
+		() => callTool(client, "send_agent_message", { session_id: TARGET, message: "harder", variant: "max" }, senderContext),
+		/pinned to variant "default"; refusing to switch it to "max"/,
+	)
+	assert.equal(prompts.length, 0)
+})
+
+test("an explicit variant matching the pinned one is delivered, not refused", async () => {
+	const { client, prompts } = statefulFakeClient({
+		[TARGET]: {
+			agent: "manager",
+			metadata: {
+				sessionPin: { agent: "manager", model: { providerID: "openai", modelID: "gpt-6-astra", variant: "high" } },
+			},
+		},
+	})
+
+	await callTool(client, "send_agent_message", { session_id: TARGET, message: "carry on", variant: "high" }, senderContext)
+
+	const body = prompts[0].body
+	assert.deepEqual(body.model, { providerID: "openai", modelID: "gpt-6-astra" })
+	assert.equal(body.variant, "high")
+})
+
+test("an agent-only pin does not constrain the variant: it applies to the session's LIVE model", async () => {
+	const { client, prompts } = statefulFakeClient({
+		[TARGET]: {
+			agent: "build",
+			model: { id: "claude-sonnet-5", providerID: "anthropic" },
+			metadata: { sessionPin: { agent: "manager" } }, // no model in the pin, so nothing to say about its variant
+		},
+	})
+
+	await callTool(client, "send_agent_message", { session_id: TARGET, message: "harder", variant: "max" }, senderContext)
+
+	const body = prompts[0].body
+	assert.equal(body.agent, "manager")
+	assert.deepEqual(body.model, { providerID: "anthropic", modelID: "claude-sonnet-5" })
+	assert.equal(body.variant, "max")
+})
+
 test("full lifecycle: pin, deliver (uses pin), unpin, deliver again (ordinary preserve-current, no pin)", async () => {
 	const { client, prompts } = statefulFakeClient({
 		[TARGET]: { agent: "manager", model: { id: "gpt-6-astra", providerID: "openai" } },

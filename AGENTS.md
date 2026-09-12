@@ -22,7 +22,7 @@ Personal OpenCode plugins for spawning, monitoring, interrupting, and messaging 
 
 - `src/spawn-session.ts`: OpenCode plugin and session tools.
 - `src/interAgent.ts`: pure inter-agent envelope helpers.
-- `src/sessionAgents.ts`: pure spawned-session agent fallback selection.
+- `src/sessionAgents.ts`: pure agent/model/variant fallback selection for a delivery.
 - `src/sessionPin.ts`: pure session-pin helpers (metadata storage shape, conflict resolution).
 - `src/beep.js`: idle notification plugin.
 
@@ -31,9 +31,17 @@ Personal OpenCode plugins for spawning, monitoring, interrupting, and messaging 
 - `set_session_pin` (self-only, no target session ID) snapshots or clears a
   durable agent/model/variant pin on the CALLING session, stored in that
   session's own `metadata` field. While pinned, `reply`/`send_agent_message`/
-  the idle-wake watchdog refuse an explicit conflicting agent or model
-  addressed to that session, and an omitted one defers to the pin instead of
-  the session's live state.
+  the idle-wake watchdog refuse an explicit conflicting agent, model or
+  variant addressed to that session, and an omitted one defers to the pin
+  instead of the session's live state.
+- The variant refusal is deliberately as strict as the model one, including
+  the case where the pin records no variant and a delivery asks for one: a
+  variant is the pinned model's effort level, so letting it through would make
+  the pin a lock with a hole in it. Changing the effort level also invalidates
+  the prompt cache, so retuning a pinned session's variant mid-run is not the
+  cheap steering move it looks like. Only a pin that records a model constrains
+  the variant at all — an agent-only pin says nothing about which model runs,
+  so it says nothing about that model's effort level either.
 - Storage is `session.metadata`, confirmed empirically to round-trip through
   `GET`/`PATCH` and survive a server restart — but `PATCH` replaces the whole
   `metadata` object wholesale (no deep merge server-side), so every writer
@@ -74,3 +82,8 @@ Personal OpenCode plugins for spawning, monitoring, interrupting, and messaging 
 
 - Uses `@opencode-ai/plugin` and TypeScript.
 - OpenCode treats every module export as a plugin factory; exported constants or helpers break loading.
+- The pinned SDK's `Model` type has no `variants`, but the live
+  `/config/providers` does report one per model (checked against 1.18.30) —
+  same schema drift as `.agent`/`.model` on `Session`. Read it through a
+  narrow structural widening, and treat an absent or empty map as "cannot
+  validate", never as "this model has no variants".
