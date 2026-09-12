@@ -360,7 +360,7 @@ export default (async ({ client }) => {
 		let pinnedAgent: string | undefined
 		let pinnedModel: DeliveryModel | undefined
 		if (pin) {
-			const resolution = resolveDeliveryAgainstPin(pin, explicitAgent, explicitModel)
+			const resolution = resolveDeliveryAgainstPin(pin, explicitAgent, explicitModel, requestedVariant)
 			if (resolution.conflict) {
 				throw new Error(
 					`Session ${opts.target} is pinned to ${resolution.conflict.field} ${JSON.stringify(resolution.conflict.pinned)}; refusing to switch it to ${JSON.stringify(resolution.conflict.requested)}. That session can remove its own pin with set_session_pin(enabled=false).`,
@@ -634,7 +634,7 @@ export default (async ({ client }) => {
 
 			set_session_pin: tool({
 				description:
-					"Pin or unpin THIS session's own current agent+model+variant to a durable snapshot (survives a server restart). While pinned, any reply/send_agent_message/idle-wake delivery addressed to this session that tries to switch it to a DIFFERENT agent or model is refused instead of applied; an omitted agent/model in an incoming delivery still defers to the pin. Self-only — there is no session_id argument, and no way to pin or unpin any other session through this tool. Calling this with enabled=true again while already pinned REPLACES the old pin with whatever the session's agent/model/variant is right now — an intentional re-snapshot, not a no-op; call it again after a legitimate model switch to update the pin. Not a security boundary: ordinary tool permissions are the only gate on calling this, same as any other tool.",
+					"Pin or unpin THIS session's own current agent+model+variant to a durable snapshot (survives a server restart). While pinned, any reply/send_agent_message/idle-wake delivery addressed to this session that tries to switch it to a DIFFERENT agent, model or model variant is refused instead of applied; an omitted agent/model/variant in an incoming delivery still defers to the pin. Self-only — there is no session_id argument, and no way to pin or unpin any other session through this tool. Calling this with enabled=true again while already pinned REPLACES the old pin with whatever the session's agent/model/variant is right now — an intentional re-snapshot, not a no-op; call it again after a legitimate model switch to update the pin. Not a security boundary: ordinary tool permissions are the only gate on calling this, same as any other tool.",
 				args: {
 					enabled: tool.schema
 						.boolean()

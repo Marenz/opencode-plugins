@@ -1,4 +1,4 @@
-import type { DeliveryModel } from "./sessionAgents.ts"
+import { NO_VARIANT, type DeliveryModel, type VariantRequest } from "./sessionAgents.ts"
 
 /**
  * A session pin: a durable snapshot of the agent/model a session should stay
@@ -75,7 +75,7 @@ export function readPin(metadata: unknown): PinSnapshot | undefined {
 	return Object.keys(pin).length > 0 ? pin : undefined
 }
 
-export type PinConflict = { field: "agent" | "model"; pinned: string; requested: string }
+export type PinConflict = { field: "agent" | "model" | "variant"; pinned: string; requested: string }
 
 export type PinResolution =
 	| { conflict: PinConflict }
@@ -90,11 +90,22 @@ export type PinResolution =
  * that never carried a variant to begin with. An explicit field that
  * differs from the pin is a conflict, reported rather than silently
  * overridden or silently ignored.
+ *
+ * An explicit `variant` is refused on exactly the same terms as an explicit
+ * model, including the case where the pin records no variant and the caller
+ * asks for one: a pin snapshots agent+model+variant together, and a variant
+ * is the model's effort level, so letting it through would make pinning a
+ * lock with a hole in it where effort is concerned. Changing that effort
+ * level also invalidates the prompt cache, so retuning a pinned session's
+ * variant mid-run is not the cheap adjustment it looks like. Only a pin
+ * that records a model constrains the variant at all — an agent-only pin
+ * says nothing about the model, so it says nothing about its variant either.
  */
 export function resolveDeliveryAgainstPin(
 	pin: PinSnapshot,
 	explicitAgent: string | undefined,
 	explicitModel: DeliveryModel | undefined,
+	requestedVariant?: VariantRequest,
 ): PinResolution {
 	if (pin.agent && explicitAgent && explicitAgent !== pin.agent) {
 		return { conflict: { field: "agent", pinned: pin.agent, requested: explicitAgent } }
@@ -109,6 +120,19 @@ export function resolveDeliveryAgainstPin(
 				field: "model",
 				pinned: `${pin.model.providerID}/${pin.model.modelID}`,
 				requested: `${explicitModel.providerID}/${explicitModel.modelID}`,
+			},
+		}
+	}
+	if (pin.model && requestedVariant && requestedVariant.variant !== pin.model.variant) {
+		return {
+			conflict: {
+				field: "variant",
+				// Both sides are reported as "default" when absent, matching the
+				// sentinel the server itself stores for "no variant chosen", so
+				// "pinned to variant X, refusing Y" never reads as a comparison
+				// against nothing.
+				pinned: pin.model.variant ?? NO_VARIANT,
+				requested: requestedVariant.variant ?? NO_VARIANT,
 			},
 		}
 	}

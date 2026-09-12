@@ -110,3 +110,58 @@ test("resolveDeliveryAgainstPin: a partial pin (model only) leaves the agent fie
 	const result = resolveDeliveryAgainstPin(pin, "build", undefined)
 	assert.deepEqual(result, { agent: "build", model: { providerID: "openai", modelID: "gpt-6-astra" } })
 })
+
+test("resolveDeliveryAgainstPin: an explicit variant differing from the pinned one is refused, like a model switch", () => {
+	// The conservative reading: a pin snapshots agent+model+variant together,
+	// and a variant is the pinned model's effort level, so allowing it
+	// through would make the pin a lock with a hole in it.
+	const pin = { model: { providerID: "openai", modelID: "gpt-6-astra", variant: "high" } }
+	assert.deepEqual(resolveDeliveryAgainstPin(pin, undefined, undefined, { variant: "max" }), {
+		conflict: { field: "variant", pinned: "high", requested: "max" },
+	})
+})
+
+test("resolveDeliveryAgainstPin: asking for a variant on a pin that records none is equally a conflict", () => {
+	const pin = { model: { providerID: "openai", modelID: "gpt-6-astra" } }
+	assert.deepEqual(resolveDeliveryAgainstPin(pin, undefined, undefined, { variant: "high" }), {
+		conflict: { field: "variant", pinned: "default", requested: "high" },
+	})
+})
+
+test("resolveDeliveryAgainstPin: asking to CLEAR a pinned variant is a conflict too", () => {
+	const pin = { model: { providerID: "openai", modelID: "gpt-6-astra", variant: "high" } }
+	assert.deepEqual(resolveDeliveryAgainstPin(pin, undefined, undefined, {}), {
+		conflict: { field: "variant", pinned: "high", requested: "default" },
+	})
+})
+
+test("resolveDeliveryAgainstPin: an explicit variant matching the pinned one passes", () => {
+	const pin = { agent: "manager", model: { providerID: "openai", modelID: "gpt-6-astra", variant: "high" } }
+	assert.deepEqual(resolveDeliveryAgainstPin(pin, undefined, undefined, { variant: "high" }), {
+		agent: "manager",
+		model: { providerID: "openai", modelID: "gpt-6-astra", variant: "high" },
+	})
+})
+
+test("resolveDeliveryAgainstPin: a pin with no model at all does not constrain the variant", () => {
+	// An agent-only pin says nothing about which model the session runs, so
+	// it says nothing about that model's effort level either.
+	const pin = { agent: "manager" }
+	assert.deepEqual(resolveDeliveryAgainstPin(pin, undefined, undefined, { variant: "high" }), {
+		agent: "manager",
+		model: undefined,
+	})
+})
+
+test("resolveDeliveryAgainstPin: a conflicting model is reported before its variant", () => {
+	const pin = { model: { providerID: "openai", modelID: "gpt-6-astra", variant: "high" } }
+	const result = resolveDeliveryAgainstPin(
+		pin,
+		undefined,
+		{ providerID: "anthropic", modelID: "claude-fable-5" },
+		{ variant: "max" },
+	)
+	assert.deepEqual(result, {
+		conflict: { field: "model", pinned: "openai/gpt-6-astra", requested: "anthropic/claude-fable-5" },
+	})
+})
