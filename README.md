@@ -9,11 +9,11 @@ session — delegation, monitoring, and now interruption.
 
 | Tool | What it does |
 |---|---|
-| `spawn_session` | Create an independent session, start it with a prompt, return its ID immediately. Optional `agent`, `model`, `fuzzy_model`. |
+| `spawn_session` | Create an independent session, start it with a prompt, return its ID immediately. Optional `agent`, `model`, `variant`, `fuzzy_model`. |
 | `list_sessions` | Recent sessions in the project scope with live status. |
 | `list_models` | Available `provider/model` IDs, grouped by provider. |
-| `send_agent_message` | Send an attributed inter-agent message to another session. Optionally `interrupt` it first and/or switch its `agent`/`model`. |
-| `reply` | Answer the agent that last messaged this session, without needing its session ID. |
+| `send_agent_message` | Send an attributed inter-agent message to another session. Optionally `interrupt` it first and/or switch its `agent`/`model`/`variant`. |
+| `reply` | Answer the agent that last messaged this session, without needing its session ID. Same optional `agent`/`model`/`variant`. |
 | `interrupt_session` | Abort whatever a session is currently running, leaving it idle. |
 | `session_set_title` | Set another session's title through the SDK instead of writing OpenCode's database directly. |
 | `wake_after_idle` / `stop_idle_wake` | Recurring idle watchdog for manager sessions. |
@@ -87,6 +87,38 @@ the replier's own scope; `directory` overrides it if that guess is wrong.
 the last user message's `agent`/`model`. The switch therefore persists for the
 rest of the session, not just one reply. Omitting `model` lets the new agent's
 own configured model take over, which is normally what you want.
+
+### Picking a variant
+
+`variant` picks a model's effort level (`low`, `high`, `max`, and whatever else
+a given model advertises, including variants declared in your own config). It
+works the same way on all three tools that take `model`:
+
+```
+send_agent_message(session_id = "ses_...", message = "...", variant = "max")
+```
+
+A variant belongs to a specific model, so the rules follow from that:
+
+- With a `model`, the variant applies to that model. Without one, it applies to
+  whatever the session is already running — on `spawn_session`, to whichever
+  model the agent picks for itself.
+- An explicit `model` with no `variant` drops the old variant, as before.
+  Switching models cannot carry an effort level across.
+- Omitting `variant` leaves the current one alone. `variant = "default"` is how
+  you clear it: `default` is the server's own sentinel for "none chosen", not a
+  selectable variant name.
+
+Where the model is known, the variant is checked against the ones that model
+advertises and a typo is refused with the available names. An empty or absent
+variants map means the server cannot tell us, not that the model has none, so
+the request goes through unchecked rather than being rejected — the server
+itself validates nothing here, and an unknown variant silently resolves to no
+options at all and then sticks to the session.
+
+While a session is pinned (`set_session_pin`), an explicit `variant` that
+differs from the pinned one is refused exactly like a model switch, including
+asking for a variant when the pin records none.
 
 ## Development
 

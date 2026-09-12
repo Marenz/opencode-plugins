@@ -34,12 +34,59 @@ export type DeliveryModel = { providerID: string; modelID: string; variant?: str
  * a different model than most sessions actually run).
  *
  * An explicit model request never carries over the old variant — a variant
- * is a variant of a specific model, so switching models drops it.
+ * is a variant of a specific model, so switching models drops it. An
+ * explicit `variant` argument is applied separately, by `deliveryVariant`.
  */
 export function deliveryModel(
 	explicitModel: DeliveryModel | undefined,
 	currentModel: DeliveryModel | undefined,
 ): DeliveryModel | undefined {
 	return explicitModel ?? currentModel
+}
+
+/** The server's sentinel for "no variant chosen"; never a selectable variant name. */
+export const NO_VARIANT = "default"
+
+/**
+ * A caller's explicit `variant` argument, once parsed. The distinction this
+ * type exists to keep is "said nothing" versus "explicitly asked for no
+ * variant": `undefined` is the former and leaves the variant alone, while
+ * `{}` is the latter and clears it.
+ */
+export type VariantRequest = { variant?: string }
+
+/**
+ * Parses a caller's `variant` argument.
+ *
+ * `"default"` is the server's own sentinel for "no variant chosen", not a
+ * variant name — `currentModelOf` already drops it on the way in and the
+ * server itself stores an absent variant as `"default"` — so a caller
+ * passing it literally means "clear the variant", the one reading
+ * consistent with that existing handling. A whitespace-only string is
+ * treated the same way rather than being sent on as a variant name no model
+ * can have.
+ */
+export function variantRequest(input: string | undefined): VariantRequest | undefined {
+	if (input === undefined) return undefined
+	const wanted = input.trim()
+	return wanted && wanted !== NO_VARIANT ? { variant: wanted } : {}
+}
+
+/**
+ * The variant to send with a delivered message: the caller's explicit
+ * request if there is one, otherwise whatever the effective model already
+ * carries (the preserved current model's variant, or a pin's).
+ *
+ * A variant belongs to a specific model, but the server takes it as its own
+ * prompt-body field rather than as part of `model` (`input.variant` in
+ * `SessionPrompt.createUserMessage`), so an explicit request still applies
+ * when the target session has no recorded model at all and the agent's own
+ * default model is about to be picked server-side.
+ */
+export function deliveryVariant(
+	requested: VariantRequest | undefined,
+	model: DeliveryModel | undefined,
+): string | undefined {
+	return requested ? requested.variant : model?.variant
 }
 

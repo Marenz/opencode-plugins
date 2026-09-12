@@ -22,7 +22,7 @@ Personal OpenCode plugins for spawning, monitoring, interrupting, and messaging 
 
 - `src/spawn-session.ts`: OpenCode plugin and session tools.
 - `src/interAgent.ts`: pure inter-agent envelope helpers.
-- `src/sessionAgents.ts`: pure spawned-session agent fallback selection.
+- `src/sessionAgents.ts`: pure agent/model/variant fallback selection for a delivery.
 - `src/sessionPin.ts`: pure session-pin helpers (metadata storage shape, conflict resolution).
 - `src/beep.js`: idle notification plugin.
 
@@ -74,3 +74,8 @@ Personal OpenCode plugins for spawning, monitoring, interrupting, and messaging 
 
 - Uses `@opencode-ai/plugin` and TypeScript.
 - OpenCode treats every module export as a plugin factory; exported constants or helpers break loading.
+- The pinned SDK's `Model` type has no `variants`, but the live
+  `/config/providers` does report one per model (checked against 1.18.30) —
+  same schema drift as `.agent`/`.model` on `Session`. Read it through a
+  narrow structural widening, and treat an absent or empty map as "cannot
+  validate", never as "this model has no variants".
