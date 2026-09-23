@@ -120,6 +120,23 @@ While a session is pinned (`set_session_pin`), an explicit `variant` that
 differs from the pinned one is refused exactly like a model switch, including
 asking for a variant when the pin records none.
 
+## `agent/` — management agents
+
+Agent definitions built on the tools above. Install by symlinking into
+`~/.config/opencode/agent/` (agent files load at OpenCode startup).
+
+| Agent | Role |
+|---|---|
+| `manager` | Single-session manager: delegates to workers, validates, talks to the user. |
+| `liaison` | Human-facing half of the two-session setup: decision queue, gated actions (merges, tags, posts), instructs the orchestrator. Never talks to workers. |
+| `orchestrator` | Worker-facing half: spawns/supervises workers, validates against `gh`/CI/diffs, sends ≤15-line decision-first digests to the liaison. Never talks to the human. |
+
+The liaison/orchestrator split keeps the human-facing context small. The
+orchestrator must address the liaison with `send_agent_message` and its
+explicit session ID — `reply` targets whichever agent messaged it last,
+which is usually a worker. Both read and maintain a shared
+`<project>/MANAGER-STATUS.md`.
+
 ## Development
 
 ```sh
