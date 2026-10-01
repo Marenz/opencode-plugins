@@ -16,6 +16,7 @@ import {
 	resolveDeliveryAgainstPin,
 } from "./sessionPin.ts"
 import { PermissionLog, observationCaveat, verdictFor } from "./permissions.ts"
+import { TODO_CONCURRENCY, mapWithLimit, sessionTodo } from "./sessionTodo.ts"
 
 type ModelRef = { providerID: string; modelID: string }
 type Resolved = ModelRef & { fuzzy: boolean }
@@ -732,6 +733,10 @@ export default (async ({ client }) => {
 						.max(100)
 						.optional()
 						.describe("Maximum sessions to return; defaults to 20 and cannot exceed 100"),
+					include_todo: tool.schema
+						.boolean()
+						.optional()
+						.describe("Add each listed session's todo summary; one request per session. Defaults to false"),
 				},
 				async execute(args, context) {
 					const directory = args.directory ?? context.directory
@@ -769,7 +774,17 @@ export default (async ({ client }) => {
 						}))
 
 					if (!sessions.length) return `No sessions matched${needle ? ` ${JSON.stringify(args.filter)}` : ""}.`
-					return JSON.stringify(sessions, null, 2)
+					if (!args.include_todo) return JSON.stringify(sessions, null, 2)
+
+					// Only now, after the filter and the limit, so what costs a
+					// request each is the rows actually returned. Without the flag
+					// there is no request at all and the rows are what they were.
+					const todo = await mapWithLimit(sessions, TODO_CONCURRENCY, (row) => sessionTodo(client, row))
+					return JSON.stringify(
+						sessions.map((row, index) => ({ ...row, todo: todo[index] })),
+						null,
+						2,
+					)
 				},
 			}),
 
