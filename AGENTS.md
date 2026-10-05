@@ -24,6 +24,7 @@ Personal OpenCode plugins for spawning, monitoring, interrupting, and messaging 
 - `src/interAgent.ts`: pure inter-agent envelope helpers.
 - `src/sessionAgents.ts`: pure agent/model/variant fallback selection for a delivery.
 - `src/sessionPin.ts`: pure session-pin helpers (metadata storage shape, conflict resolution).
+- `src/sessionTodo.ts`: pure todo-summary helpers for `list_sessions`' `include_todo`.
 - `src/beep.js`: idle notification plugin.
 
 ## Session pin

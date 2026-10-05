@@ -10,13 +10,43 @@ session — delegation, monitoring, and now interruption.
 | Tool | What it does |
 |---|---|
 | `spawn_session` | Create an independent session, start it with a prompt, return its ID immediately. Optional `agent`, `model`, `variant`, `fuzzy_model`. |
-| `list_sessions` | Recent sessions in the project scope with live status. |
+| `list_sessions` | Recent sessions in the project scope with live status. Optional `include_todo` adds each session's todo summary. |
 | `list_models` | Available `provider/model` IDs, grouped by provider. |
 | `send_agent_message` | Send an attributed inter-agent message to another session. Optionally `interrupt` it first and/or switch its `agent`/`model`/`variant`. |
 | `reply` | Answer the agent that last messaged this session, without needing its session ID. Same optional `agent`/`model`/`variant`. |
 | `interrupt_session` | Abort whatever a session is currently running, leaving it idle. |
 | `session_set_title` | Set another session's title through the SDK instead of writing OpenCode's database directly. |
 | `wake_after_idle` / `stop_idle_wake` | Recurring idle watchdog for manager sessions. |
+
+### Following a worker's todo list
+
+`list_sessions(include_todo = true)` adds a `todo` object to every row
+it returns, read from the session's todo list, so a manager can see how far a
+worker has got without the worker spending a turn on a report:
+
+```json
+{ "completed": 3, "total": 8, "cancelled": 1, "in_progress": ["Add token columns"] }
+```
+
+- `total` counts the items that are not cancelled, and `completed` the ones
+  done. A cancelled item is neither, so cancelling never counts as completing.
+  It counts items, not time or effort: a worker can still be wrapping up after
+  its last item, so keep waiting for its final report.
+- `in_progress` has the text of each item in progress, in list order, each on
+  one line: what the worker is doing now. It is empty when nothing is in
+  progress, and the next pending item is never presented as started. Usually
+  there is one.
+- A session with no todo list, or one where everything is cancelled, has
+  `total: 0`. `"todo": null` means the todo could not be read, because the
+  request failed or the answer was not a list; it says nothing about the todo,
+  and does not fail the rest of the listing.
+
+The flag is off by default, and without it no todo is requested and the rows are
+unchanged. With it, the todos are requested only for the rows that are left
+after `filter` and `limit`, at most four at a time, each in the directory of its
+own session. It is a snapshot of the moment it runs, not a subscription: it
+neither wakes a session nor sends anything, so call it when you are awake
+anyway.
 
 ### Interrupting and redirecting
 
